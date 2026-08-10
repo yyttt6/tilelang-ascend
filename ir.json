@@ -1,0 +1,29 @@
+{
+  "task": {
+"vars":["cid","vid"],"ranges":["1","2"]  },
+  "vars": [
+  ],
+  "ops": [
+    {"level":"TileOp","op_type":"copy","inputs":["A"],"outputs":["src_l1"],"config":{"dst_indices":"[0, 0]","src_indices":"[0, 0]"}},
+    {"level":"TileOp","op_type":"copy","inputs":["B"],"outputs":["a_l1"],"config":{"dst_indices":"[0, 0]","src_indices":"[0, 0]"}},
+    {"level":"TileOp","op_type":"pipebarrier","inputs":[],"outputs":[],"config":{}},
+    {"level":"TileOp","op_type":"copy","inputs":["a_l1"],"outputs":["a_l0"],"config":{"dst_indices":"[0, 0]","src_indices":"[0, 0]"}},
+    {"level":"TileOp","op_type":"pipebarrier","inputs":[],"outputs":[],"config":{}},
+    {"level":"ForOp","var":"_","min":"0","extent":"4096","op_list":[
+        {"level":"TileOp","op_type":"copy","inputs":["src_l1"],"outputs":["b_l0"],"config":{"dst_indices":"[0, 0]","src_indices":"[0, 0]"}}
+    ]},
+    {"level":"TileOp","op_type":"pipebarrier","inputs":[],"outputs":[],"config":{}},
+    {"level":"TileOp","op_type":"pipebarrier","inputs":[],"outputs":[],"config":{}},
+    {"level":"TileOp","op_type":"copy","inputs":["c_l0"],"outputs":["C"],"config":{"dst_indices":"[0, 0]","src_indices":"[0, 0]"}}
+  ],
+  "tensors": {
+    "c_l0": {"name":"c_l0","dtype":"fp32","mem_loc":"wmma.accumulator","shape":["16","128"]},
+    "b_l0": {"name":"b_l0","dtype":"fp16","mem_loc":"wmma.matrix_b","shape":["256","128"]},
+    "a_l0": {"name":"a_l0","dtype":"fp16","mem_loc":"wmma.matrix_a","shape":["16","256"]},
+    "src_l1": {"name":"src_l1","dtype":"fp16","mem_loc":"shared.dyn","shape":["256","256"]},
+    "a_l1": {"name":"a_l1","dtype":"fp16","mem_loc":"shared.dyn","shape":["16","256"]},
+    "B": {"name":"B","dtype":"fp16","mem_loc":"global","shape":["16","256"]},
+    "C": {"name":"C","dtype":"fp32","mem_loc":"global","shape":["16","128"]},
+    "A": {"name":"A","dtype":"fp16","mem_loc":"global","shape":["256","256"]}
+  }
+}
