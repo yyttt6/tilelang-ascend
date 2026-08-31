@@ -94,6 +94,7 @@ class JITKernel:
         self.target_host = target_host
         self.platform = platform
         self.verbose = verbose
+        self._has_dynamic_args = False
 
         if pass_configs is None:
             pass_configs = {}
@@ -120,6 +121,7 @@ class JITKernel:
         # The adapter's function is assigned as the callable function for this instance.
         self.adapter = adapter
         self.torch_function = adapter.func
+        self._has_dynamic_args = bool(adapter.dynamic_symbolic_map)
 
     @classmethod
     def from_database(
@@ -168,6 +170,7 @@ class JITKernel:
             compile_flags=compile_flags,
         )
         instance.torch_function = instance.adapter.func
+        instance._has_dynamic_args = bool(instance.adapter.dynamic_symbolic_map)
         return instance
 
     def _generate_extra_args(self, *args):
@@ -182,6 +185,8 @@ class JITKernel:
         return modify_args
 
     def __call__(self, *args: Any, **kwds: Any) -> Any:
+        if not self._has_dynamic_args:
+            return self.torch_function(*args, **kwds)
         modify_args = self._generate_extra_args(*args)
         """
         Invokes the compiled function with the given arguments.

@@ -23,6 +23,12 @@ class PassConfigKey(str, Enum):
     TL_DISABLE_WARP_SPECIALIZED = "tl.disable_warp_specialized"
     """Disable warp specialization optimization. Default: False"""
 
+    TL_ENABLE_FAST_MATH = "tl.enable_fast_math"
+    """Enable fast math optimization. Ignored on Ascend targets."""
+
+    TL_DISABLE_THREAD_STORAGE_SYNC = "tl.disable_thread_storage_sync"
+    """Disable thread storage synchronization. Ignored on Ascend targets."""
+
     TL_CONFIG_INDEX_BITWIDTH = "tl.config_index_bitwidth"
     """Bitwidth for configuration indices. Default: 32"""
 
@@ -165,6 +171,12 @@ def _apply_target_pass_defaults(
 
     model = _resolve_target_model(target)
     effective = "ascendc" if model in ("auto", "") else model
+
+    # TileOPs passes these keys; Ascend has no corresponding passes, so accept and ignore them.
+    if effective in ("ascendc", "pto"):
+        configs.pop(PassConfigKey.TL_ENABLE_FAST_MATH.value, None)
+        configs.pop(PassConfigKey.TL_DISABLE_THREAD_STORAGE_SYNC.value, None)
+
     defaults = _TARGET_PASS_DEFAULTS.get(effective, {})
 
     for key_str, val in defaults.items():

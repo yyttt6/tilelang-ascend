@@ -3,6 +3,7 @@
 # cython: language_level=3
 
 import torch
+import torch_npu
 cimport cython
 import ctypes
 from libc.stdint cimport int64_t, uintptr_t
@@ -29,6 +30,10 @@ cdef class CythonKernelWrapper:
         list param_dtypes    # Cache for parameter dtypes
         list param_shapes    # Cache for parameter shapes as native Python lists
         object get_current_device
+        object get_current_raw_stream
+        object analyzer       # Lazily-created Analyzer for dynamic shape expressions
+        list param_is_scalar  # Build-time parameter classification
+        list call_args_template  # Reusable slot layout for static kernels
     def __cinit__(self, result_idx, workspace_idx, auto_gm_idx, params, lib):
         # Initialize wrapper with kernel configuration
         self.result_idx = result_idx
@@ -38,9 +43,17 @@ cdef class CythonKernelWrapper:
         self.lib = lib
         # Convert TVM types to native Python types during initialization
         self.param_dtypes = [param.dtype for param in params]
+        self.param_is_scalar = [len(param.shape) == 0 for param in params]
+        self.call_args_template = [None] * (len(params) + 1)
+        self.analyzer = None
         # Convert TVM shape arrays to native Python lists
         self.param_shapes = []
         self.get_current_device = torch.npu.current_device
+        # The raw-stream accessor avoids constructing a Stream wrapper on every call.
+        # Keep the public API fallback for torch_npu versions without this helper.
+        self.get_current_raw_stream = getattr(
+            torch_npu._C, "_npu_getCurrentRawStream", None
+        )
         for param in params:
             native_shape = []
             for dim in param.shape:
@@ -72,7 +85,7 @@ cdef class CythonKernelWrapper:
         self.buffer_device_map = buffer_device_map
         return self
 
-    cpdef forward(self, list inputs, int64_t stream = -1):
+    cpdef forward(self, object inputs, int64_t stream = -1):
         # Validate input dimensions and prepare for kernel execution
         cdef int total_params = len(self.params)
         cdef int total_inputs = len(inputs)
@@ -80,23 +93,34 @@ cdef class CythonKernelWrapper:
         cdef int total_workspace_idx = len(self.workspace_idx)
         cdef int total_auto_gm_idx = len(self.auto_gm_idx)
         cdef int total_dynamic_symbolics = len(self.dynamic_symbolic_map)
+        cdef list call_args
 
         # Ensure the number of inputs matches expected parameter count
 
         if stream == -1: 
             if torch.npu.is_available():
-                stream = torch.npu.current_stream().npu_stream
+                if self.get_current_raw_stream is not None:
+                    device_index = None
+                    if len(inputs) > 0 and isinstance(inputs[0], torch.Tensor):
+                        device_index = inputs[0].device.index
+                    if device_index is None:
+                        device_index = self.get_current_device()
+                    stream = self.get_current_raw_stream(device_index)
+                else:
+                    stream = torch.npu.current_stream().npu_stream
             else:
                 stream = 0
 
         cdef int ins_idx = 0
         cdef list tensor_list = []
 
-        analyzer = Analyzer()
         sym_val_by_name = {}
-        for key, (ref_tensor_idx, ref_shape_idx) in self.dynamic_symbolic_map.items():
-            val = int(inputs[ref_tensor_idx].shape[ref_shape_idx])
-            sym_val_by_name[str(key)] = val
+        if total_dynamic_symbolics > 0:
+            if self.analyzer is None:
+                self.analyzer = Analyzer()
+            for key, (ref_tensor_idx, ref_shape_idx) in self.dynamic_symbolic_map.items():
+                val = int(inputs[ref_tensor_idx].shape[ref_shape_idx])
+                sym_val_by_name[str(key)] = val
 
         # Prepare input and output tensors
         for i in range(len(self.params)):
@@ -117,7 +141,7 @@ cdef class CythonKernelWrapper:
                                 raise KeyError(f"Unfounded symbolic var: {str(v)}")
                             vmap[v] = tir.IntImm(v.dtype, sym_val_by_name[str(v)])
                         ss = stmt_functor.substitute(s, vmap)
-                        ss = analyzer.simplify(ss)
+                        ss = self.analyzer.simplify(ss)
                         if isinstance(ss, tir.IntImm):
                             res = int(ss.value)
                         else:
@@ -140,26 +164,47 @@ cdef class CythonKernelWrapper:
                 ins_idx += 1
             tensor_list.append(tensor)
         
-        # Convert tensor pointers to C void pointers for kernel call
-        call_args = []
-        for i in range(len(tensor_list)):
-            tensor = tensor_list[i]
-            if isinstance(tensor, torch.Tensor):
-                if not tensor.is_contiguous():
-                    raise ValueError(f"Input tensor at index {i} must be contiguous")
-                call_args.append(ctypes.c_void_p(tensor.data_ptr()))
-            elif isinstance(tensor, int):
-                # Dynamic symbolics which are passed as integer arguments
-                if i in self.ptr_map:
-                    call_args.append(ctypes.c_void_p(tensor))
+        # Convert tensor pointers to C void pointers for kernel call.  Static
+        # kernels reuse a build-time slot layout; dynamic kernels retain the
+        # original append path because their symbolic ABI is runtime-dependent.
+        if total_dynamic_symbolics == 0:
+            call_args = self.call_args_template.copy()
+            for i in range(len(tensor_list)):
+                tensor = tensor_list[i]
+                if isinstance(tensor, torch.Tensor):
+                    if not tensor.is_contiguous():
+                        raise ValueError(f"Input tensor at index {i} must be contiguous")
+                    call_args[i] = ctypes.c_void_p(tensor.data_ptr())
+                elif isinstance(tensor, int):
+                    if i in self.ptr_map:
+                        call_args[i] = ctypes.c_void_p(tensor)
+                    else:
+                        call_args[i] = tensor
+                elif isinstance(tensor, float):
+                    call_args[i] = ctypes.c_float(tensor)
+                elif isinstance(tensor, bool):
+                    call_args[i] = ctypes.c_bool(tensor)
                 else:
-                    call_args.append(tensor)
-            elif isinstance(tensor, float):
-                call_args.append(ctypes.c_float(tensor))
-            elif isinstance(tensor, bool):
-                call_args.append(ctypes.c_bool(tensor))
-            else:
-                raise ValueError(f"Unsupported tensor type: {type(tensor)}")
+                    raise ValueError(f"Unsupported tensor type: {type(tensor)}")
+        else:
+            call_args = []
+            for i in range(len(tensor_list)):
+                tensor = tensor_list[i]
+                if isinstance(tensor, torch.Tensor):
+                    if not tensor.is_contiguous():
+                        raise ValueError(f"Input tensor at index {i} must be contiguous")
+                    call_args.append(ctypes.c_void_p(tensor.data_ptr()))
+                elif isinstance(tensor, int):
+                    if i in self.ptr_map:
+                        call_args.append(ctypes.c_void_p(tensor))
+                    else:
+                        call_args.append(tensor)
+                elif isinstance(tensor, float):
+                    call_args.append(ctypes.c_float(tensor))
+                elif isinstance(tensor, bool):
+                    call_args.append(ctypes.c_bool(tensor))
+                else:
+                    raise ValueError(f"Unsupported tensor type: {type(tensor)}")
 
         # Check buffer device
         # cdef str tensor_list_device_type = tensor_list[0].device.type
@@ -187,12 +232,14 @@ cdef class CythonKernelWrapper:
         #                raise ValueError(f"Static shape mismatch for parameter {param}: expected {shape} at index {shape_idx}, got {tensor_list[buffer_idx].shape}")
 
         # Add dynamic dimension values to kernel arguments
-        for _, (buffer_idx, shape_idx) in self.dynamic_symbolic_map.items():
-            call_args.append(ctypes.c_int64(inputs[buffer_idx].shape[shape_idx]))
+        if total_dynamic_symbolics > 0:
+            for _, (buffer_idx, shape_idx) in self.dynamic_symbolic_map.items():
+                call_args.append(ctypes.c_int64(inputs[buffer_idx].shape[shape_idx]))
+            call_args.append(ctypes.c_void_p(stream))
+        else:
+            call_args[-1] = ctypes.c_void_p(stream)
 
         # Add npu stream to kernel arguments
-        call_args.append(ctypes.c_void_p(stream))
-
         # Execute the kernel
         self.lib.call(*call_args)
 
@@ -201,4 +248,3 @@ cdef class CythonKernelWrapper:
             return tensor_list[self.result_idx[0]]
         else:
             return [tensor_list[i] for i in self.result_idx]
-    

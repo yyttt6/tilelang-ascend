@@ -28,6 +28,8 @@ import logging
 import site
 
 logger = logging.getLogger(__name__)
+_PTR_SLOT = object()
+_VALUE_SLOT = object()
 
 
 def get_cython_compiler() -> str | None:
@@ -284,6 +286,7 @@ class CythonKernelAdapter(BaseKernelAdapter):
         self.cython_wrapper.set_static_shape_map(self.static_shape_map)
         self.cython_wrapper.set_buffer_device_map(self.buffer_device_map)
         self.cython_wrapper.set_ptr_map(self.ptr_map)
+        self._static_ctypes_template = self._build_static_ctypes_template()
         self._post_init()
 
     @classmethod
@@ -344,6 +347,7 @@ class CythonKernelAdapter(BaseKernelAdapter):
         adapter.cython_wrapper.set_static_shape_map(adapter.static_shape_map)
         adapter.cython_wrapper.set_buffer_device_map(adapter.buffer_device_map)
         adapter.cython_wrapper.set_ptr_map(adapter.ptr_map)
+        adapter._static_ctypes_template = adapter._build_static_ctypes_template()
 
         adapter._post_init()
         return adapter
@@ -444,15 +448,32 @@ class CythonKernelAdapter(BaseKernelAdapter):
 
         Converts PyTorch tensor pointers to C void pointers for ctypes interface.
         """
-        ctypes_args = [ctypes.c_void_p(arr.data_ptr()) if not isinstance(arr, int) else arr for arr in args]
-        ctypes_args.append(ctypes.c_void_p(stream))
+        template = self._static_ctypes_template
+        if template is None:
+            ctypes_args = [ctypes.c_void_p(arr.data_ptr()) if not isinstance(arr, int) else arr for arr in args]
+            ctypes_args.append(ctypes.c_void_p(stream))
+        else:
+            ctypes_args = list(template)
+            for index, arr in enumerate(args):
+                if template[index] is _PTR_SLOT:
+                    ctypes_args[index] = ctypes.c_void_p(arr.data_ptr())
+                else:
+                    ctypes_args[index] = arr
+            ctypes_args[-1] = ctypes.c_void_p(stream)
         self.lib.call(*ctypes_args)
+
+    def _build_static_ctypes_template(self):
+        if self.dynamic_symbolic_map:
+            return None
+        return [(_VALUE_SLOT if len(param.shape) == 0 else _PTR_SLOT) for param in self.params] + [None]
 
     def _convert_torch_func(self) -> Callable:
         """Returns a PyTorch-compatible function wrapper for the kernel."""
 
+        forward = self.cython_wrapper.forward
+
         def lambda_forward(*args, stream: int = -1):
-            return self.cython_wrapper.forward([*args], stream=stream)
+            return forward(args, stream=stream)
 
         return lambda_forward
 
